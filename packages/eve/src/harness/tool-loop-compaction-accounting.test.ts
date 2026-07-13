@@ -1,9 +1,18 @@
-import { generateText, jsonSchema, type LanguageModel, ToolLoopAgent } from "ai";
+import { generateText, jsonSchema, type LanguageModel, type ModelMessage, ToolLoopAgent } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ContextContainer, contextStorage } from "#context/container.js";
+import { preserveFrameworkStateOnCompaction } from "#execution/compaction.js";
 import { setPendingInputBatch } from "#harness/input-requests.js";
 import { createToolLoopHarness } from "#harness/tool-loop.js";
-import type { HarnessSession, StepFn, StepNext, ToolLoopHarnessConfig } from "#harness/types.js";
+import type {
+  HarnessSession,
+  StepFn,
+  StepNext,
+  StepResult,
+  ToolLoopHarnessConfig,
+} from "#harness/types.js";
+import { TodoStateKey } from "#runtime/framework-tools/todo.js";
 
 vi.mock("ai", () => ({
   generateText: vi.fn(),
@@ -77,17 +86,26 @@ function getMockResponseMessages(result: Record<string, unknown>): unknown[] {
 function setupMockAgentSequence(results: readonly Record<string, unknown>[]): void {
   const queue = [...results];
 
+  setupMockAgentResponder(() => {
+    const result = queue.shift();
+    if (result === undefined) {
+      throw new Error("No mock ToolLoopAgent result available.");
+    }
+    return result;
+  });
+}
+
+function setupMockAgentResponder(
+  respond: (messages: readonly ModelMessage[]) => Record<string, unknown>,
+): void {
   vi.mocked(ToolLoopAgent).mockImplementation(function (
     this: Record<string, unknown>,
     settings: MockAgentSettings,
   ) {
     const { onStepFinish, prepareStep } = settings;
 
-    this.generate = vi.fn().mockImplementation(async (options: { messages: unknown[] }) => {
-      const result = queue.shift();
-      if (result === undefined) {
-        throw new Error("No mock ToolLoopAgent result available.");
-      }
+    this.generate = vi.fn().mockImplementation(async (options: { messages: ModelMessage[] }) => {
+      const result = respond(options.messages);
 
       if (prepareStep) {
         await prepareStep({
@@ -121,7 +139,213 @@ function expectStepFn(value: StepNext): StepFn {
   return value;
 }
 
+function toolCallStep(input: {
+  readonly callId: string;
+  readonly output: Record<string, unknown>;
+  readonly toolInput: Record<string, unknown>;
+  readonly toolName: string;
+}): Record<string, unknown> {
+  return {
+    finishReason: "tool-calls",
+    response: {
+      messages: [
+        {
+          content: [
+            {
+              input: input.toolInput,
+              toolCallId: input.callId,
+              toolName: input.toolName,
+              type: "tool-call",
+            },
+          ],
+          role: "assistant",
+        },
+        {
+          content: [
+            {
+              output: { type: "json", value: input.output },
+              toolCallId: input.callId,
+              toolName: input.toolName,
+              type: "tool-result",
+            },
+          ],
+          role: "tool",
+        },
+      ],
+    },
+    text: "",
+    toolCalls: [
+      {
+        input: input.toolInput,
+        toolCallId: input.callId,
+        toolName: input.toolName,
+        type: "tool-call",
+      },
+    ],
+    toolResults: [
+      {
+        output: input.output,
+        toolCallId: input.callId,
+        toolName: input.toolName,
+        type: "tool-result",
+      },
+    ],
+    usage: { inputTokens: 101 },
+  };
+}
+
+function textStep(text: string): Record<string, unknown> {
+  return {
+    finishReason: "stop",
+    response: { messages: [{ content: text, role: "assistant" }] },
+    text,
+    toolCalls: [],
+    toolResults: [],
+    usage: { inputTokens: 101 },
+  };
+}
+
+function createRegressionSession(toolName: string): HarnessSession {
+  return createTestSession({
+    agent: {
+      modelReference: { id: "test-model" },
+      system: "Complete successful work once. Do not repeat it after compaction.",
+      tools: [
+        {
+          description: "Completes one test work unit.",
+          inputSchema: { type: "object" },
+          name: toolName,
+        },
+      ],
+    },
+    compaction: { recentWindowSize: 10, threshold: 100 },
+  });
+}
+
+function createRegressionConfig(
+  toolName: string,
+  overrides?: Partial<ToolLoopHarnessConfig>,
+): ToolLoopHarnessConfig {
+  return createTestConfig({
+    mode: "task",
+    tools: new Map([
+      [
+        toolName,
+        {
+          description: "Completes one test work unit.",
+          execute: vi.fn(),
+          inputSchema: jsonSchema({ type: "object" }),
+          name: toolName,
+        },
+      ],
+    ]),
+    ...overrides,
+  });
+}
+
+async function runAtMostTenModelSteps(input: {
+  readonly message: string;
+  readonly runStep: StepFn;
+  readonly session: HarnessSession;
+}): Promise<StepResult> {
+  let result = await input.runStep(input.session, { message: input.message });
+
+  for (let step = 1; step < 10 && typeof result.next === "function"; step += 1) {
+    result = await result.next(result.session);
+  }
+
+  return result;
+}
+
 describe("tool-loop structured compaction accounting", () => {
+  it("does not repeat an identical successful tool call after compaction", async () => {
+    const completionMarker = "REPOSITORY_INSPECTION_COMPLETE";
+    let inspectCalls = 0;
+
+    vi.mocked(generateText).mockResolvedValue({
+      text: "Goal: inspect the repository. Accomplished: none. Next: inspect the repository.",
+    } as Awaited<ReturnType<typeof generateText>>);
+    setupMockAgentResponder((messages) => {
+      if (JSON.stringify(messages).includes(completionMarker)) {
+        return textStep(`Done: ${completionMarker}`);
+      }
+
+      inspectCalls += 1;
+      return toolCallStep({
+        callId: `inspect-${inspectCalls}`,
+        output: { completionMarker, payload: "x".repeat(400) },
+        toolInput: { scope: "repository" },
+        toolName: "inspect_repository",
+      });
+    });
+
+    const runStep = createToolLoopHarness(createRegressionConfig("inspect_repository"));
+    const result = await runAtMostTenModelSteps({
+      message: "Inspect the repository once and report the completion marker.",
+      runStep,
+      session: createRegressionSession("inspect_repository"),
+    });
+
+    expect(inspectCalls).toBe(1);
+    expect(generateText).toHaveBeenCalled();
+    expect(result.next).toEqual({ done: true, output: `Done: ${completionMarker}` });
+  });
+
+  it("does not repeat completed work when a stale todo remains pending after compaction", async () => {
+    const completionMarker = "SOURCE_ANALYSIS_COMPLETE";
+    const context = new ContextContainer();
+    const workInputs: Record<string, unknown>[] = [];
+
+    context.set(TodoStateKey, {
+      items: [{ content: "Complete source analysis", priority: "high", status: "pending" }],
+    });
+    vi.mocked(generateText).mockResolvedValue({
+      text:
+        "Goal: analyze the source. Accomplished: source-analysis is complete. " +
+        `Evidence: ${completionMarker}. Next: report the evidence without repeating work.`,
+    } as Awaited<ReturnType<typeof generateText>>);
+    setupMockAgentResponder((messages) => {
+      const lastUserMessage = messages.findLast((message) => message.role === "user");
+      const staleTodoIsLast =
+        typeof lastUserMessage?.content === "string" &&
+        lastUserMessage.content.includes("[ ] [high] Complete source analysis");
+
+      if (!staleTodoIsLast && JSON.stringify(messages).includes(completionMarker)) {
+        return textStep(`Done: ${completionMarker}`);
+      }
+
+      const toolInput = {
+        attempt: workInputs.length + 1,
+        query: `source-${workInputs.length + 1}`,
+      };
+      workInputs.push(toolInput);
+      return toolCallStep({
+        callId: `source-analysis-${workInputs.length}`,
+        output: { completionMarker, payload: "x".repeat(400), workUnit: "source-analysis" },
+        toolInput,
+        toolName: "perform_source_analysis",
+      });
+    });
+
+    const runStep = createToolLoopHarness(
+      createRegressionConfig("perform_source_analysis", {
+        onCompaction: preserveFrameworkStateOnCompaction,
+      }),
+    );
+    const result = await contextStorage.run(context, () =>
+      runAtMostTenModelSteps({
+        message: "Complete source analysis once, then report the completion marker.",
+        runStep,
+        session: createRegressionSession("perform_source_analysis"),
+      }),
+    );
+
+    expect(new Set(workInputs.map((entry) => JSON.stringify(entry))).size).toBe(workInputs.length);
+    expect(workInputs).toHaveLength(1);
+    expect(generateText).toHaveBeenCalled();
+    expect(result.next).toEqual({ done: true, output: `Done: ${completionMarker}` });
+  });
+
   it("compacts before the continuation step when structured tool results were appended", async () => {
     vi.mocked(generateText).mockResolvedValue({
       text: "summary",
